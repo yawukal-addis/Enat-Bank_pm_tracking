@@ -1,6 +1,6 @@
 ﻿import React, { useState, useEffect } from 'react';
 import { 
-  Shield, CheckCircle, Clock, AlertTriangle, Building2, Wrench, Bell,
+  CheckCircle, Clock, AlertTriangle, Building2, Wrench, Bell,
   RefreshCw, X, Plus, Trash2, LogOut, User
 } from 'lucide-react';
 
@@ -623,12 +623,10 @@ export default function App() {
     return (
       <main className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
         <section className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-lg p-8">
-          <div className="flex items-center gap-3 mb-8">
-            <div className="p-3 bg-indigo-100 rounded-xl">
-              <Shield className="w-7 h-7 text-indigo-700" />
-            </div>
+          <div className="flex items-center gap-4 mb-8">
+            <img src="/enat.png" alt="Enat Bank logo" className="h-16 w-20 shrink-0 rounded-lg bg-white object-contain" />
             <div>
-              <h1 className="text-xl font-bold text-slate-900">Enat &Moti PM Tracking</h1>
+              <h1 className="text-xl font-bold text-slate-900">Enat &amp; Moti PM Tracking</h1>
               <p className="text-sm text-slate-500">Sign in to your assigned workspace</p>
             </div>
           </div>
@@ -679,9 +677,7 @@ export default function App() {
       <header className="sticky top-0 z-40 bg-indigo-900 text-white shadow-lg">
         <div className="max-w-7xl mx-auto px-4 py-4 flex flex-wrap justify-between items-center gap-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-indigo-700 rounded-lg">
-              <Shield className="w-6 h-6 text-indigo-200" />
-            </div>
+            <img src="/enat.png" alt="Enat Bank logo" className="h-12 w-16 shrink-0 rounded-lg bg-white p-1 object-contain" />
             <div>
               <h1 className="text-xl font-bold tracking-wide">ATM Preventive Maintenance Automation</h1>
               <p className="text-xs text-indigo-300">Enat Bank Dbs Teams & Moti Engineering PM Verification Portal</p>
