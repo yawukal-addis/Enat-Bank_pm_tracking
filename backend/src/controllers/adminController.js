@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const db = require('../config/db');
 const { randomBytes } = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -94,12 +96,15 @@ exports.createBranch = async (req, res) => {
 };
 
 exports.createAtm = async (req, res) => {
-  const { terminal_id, branch_id, model } = req.body;
-  if (!terminal_id?.trim() || !branch_id) return res.status(400).json({ error: 'Terminal ID and branch are required' });
+  const { terminal_id, branch_id, model, serial_number } = req.body;
+  if (typeof terminal_id !== 'string' || !terminal_id.trim() ||
+      !branch_id || typeof serial_number !== 'string' || !serial_number.trim()) {
+    return res.status(400).json({ error: 'Terminal ID, branch, and ATM serial number are required' });
+  }
   try {
     const result = await db.query(
-      'INSERT INTO atms (terminal_id, branch_id, model) VALUES ($1, $2, $3) RETURNING *',
-      [terminal_id.trim(), branch_id, model?.trim() || 'NCR SelfServ 84']
+      'INSERT INTO atms (terminal_id, branch_id, model, serial_number) VALUES ($1, $2, $3, $4) RETURNING *',
+      [terminal_id.trim(), branch_id, typeof model === 'string' ? model.trim() || 'NCR SelfServ 84' : 'NCR SelfServ 84', serial_number.trim()]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -107,9 +112,85 @@ exports.createAtm = async (req, res) => {
   }
 };
 
+exports.updateAtm = async (req, res) => {
+  const atmId = Number(req.params.id);
+  const { terminal_id, model, serial_number } = req.body;
+  if (!Number.isInteger(atmId) || atmId < 1 ||
+      typeof terminal_id !== 'string' || !terminal_id.trim() || terminal_id.trim().length > 50 ||
+      typeof model !== 'string' || !model.trim() || model.trim().length > 100 ||
+      (serial_number != null && (typeof serial_number !== 'string' || serial_number.trim().length > 100))) {
+    return res.status(400).json({ error: 'A valid terminal ID and ATM model are required' });
+  }
+
+  let client;
+  try {
+    client = await db.pool.connect();
+    await client.query('BEGIN');
+    const current = await client.query(
+      'SELECT id, terminal_id, branch_id, is_active FROM atms WHERE id = $1 FOR UPDATE',
+      [atmId]
+    );
+    if (!current.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'ATM terminal not found' });
+    }
+
+    const oldTerminalId = current.rows[0].terminal_id;
+    const newTerminalId = terminal_id.trim();
+    const normalizedSerial = typeof serial_number === 'string' && serial_number.trim()
+      ? serial_number.trim()
+      : null;
+    if (newTerminalId === oldTerminalId) {
+      await client.query(
+        'UPDATE atms SET model = $1, serial_number = $2 WHERE id = $3',
+        [model.trim(), normalizedSerial, atmId]
+      );
+    } else {
+      const replacement = await client.query(
+        `INSERT INTO atms (terminal_id, branch_id, model, serial_number, is_active)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING terminal_id`,
+        [newTerminalId, current.rows[0].branch_id, model.trim(), normalizedSerial, current.rows[0].is_active]
+      );
+      await client.query(
+        'UPDATE pm_visits SET terminal_id = $1 WHERE terminal_id = $2',
+        [replacement.rows[0].terminal_id, oldTerminalId]
+      );
+      await client.query(
+        'UPDATE user_atms SET terminal_id = $1 WHERE terminal_id = $2',
+        [replacement.rows[0].terminal_id, oldTerminalId]
+      );
+      await client.query('DELETE FROM atms WHERE id = $1', [atmId]);
+    }
+
+    const updated = await client.query(
+      `SELECT a.*, b.branch_name, b.branch_code, b.region
+       FROM atms a JOIN branches b ON b.id = a.branch_id
+       WHERE a.terminal_id = $1`,
+      [newTerminalId]
+    );
+    if (!updated.rowCount) throw new Error('Updated ATM terminal could not be reloaded');
+    await client.query('COMMIT');
+    res.json(updated.rows[0]);
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That terminal ID is already registered' });
+    }
+    console.error('Failed to update ATM terminal:', err);
+    res.status(500).json({ error: 'Failed to update ATM terminal' });
+  } finally {
+    client?.release();
+  }
+};
+
 exports.createBranchAndAtm = async (req, res) => {
-  const { branch_code, branch_name, region, terminal_id, model } = req.body;
-  if (!branch_name?.trim() || !terminal_id?.trim()) return res.status(400).json({ error: 'Branch name and terminal ID are required' });
+  const { branch_code, branch_name, region, terminal_id, model, serial_number } = req.body;
+  if (typeof branch_name !== 'string' || !branch_name.trim() ||
+      typeof terminal_id !== 'string' || !terminal_id.trim() ||
+      typeof serial_number !== 'string' || !serial_number.trim()) {
+    return res.status(400).json({ error: 'Branch name, terminal ID, and ATM serial number are required' });
+  }
   const normalizedBranchName = branch_name.trim().replace(/\s+/g, ' ');
   const normalizedTerminalId = terminal_id.trim();
   let client;
@@ -132,12 +213,13 @@ exports.createBranchAndAtm = async (req, res) => {
       branchId = created.rows[0].id;
     }
     const terminal = await client.query(
-      `INSERT INTO atms (terminal_id, branch_id, model)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (terminal_id) DO UPDATE SET model = EXCLUDED.model
+      `INSERT INTO atms (terminal_id, branch_id, model, serial_number)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (terminal_id) DO UPDATE
+         SET model = EXCLUDED.model, serial_number = EXCLUDED.serial_number
          WHERE atms.branch_id = EXCLUDED.branch_id
        RETURNING id`,
-      [normalizedTerminalId, branchId, model?.trim() || 'NCR SelfServ 84']
+      [normalizedTerminalId, branchId, typeof model === 'string' ? model.trim() || 'NCR SelfServ 84' : 'NCR SelfServ 84', serial_number.trim()]
     );
     if (!terminal.rowCount) {
       const error = new Error('This terminal ID is already registered to another branch. Enter a unique terminal ID.');
@@ -223,7 +305,8 @@ exports.downloadScheduleTemplate = async (_req, res) => {
     sheet.columns = [
       { header: 'Branch Name', key: 'branch_name', width: 32 },
       { header: 'Terminal ID', key: 'terminal_id', width: 20 },
-      { header: 'Scheduled Date', key: 'scheduled_date', width: 20 },
+      { header: 'Date From', key: 'date_from', width: 20 },
+      { header: 'Date To', key: 'date_to', width: 20 },
     ];
     sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF3730A3' } };
@@ -237,6 +320,207 @@ exports.downloadScheduleTemplate = async (_req, res) => {
   } catch (err) {
     console.error('Failed to generate schedule template:', err);
     res.status(500).json({ error: 'Failed to generate schedule template' });
+  }
+};
+
+exports.downloadPmReport = async (req, res) => {
+  const visitId = Number(req.params.id);
+  if (!Number.isInteger(visitId) || visitId < 1) {
+    return res.status(400).json({ error: 'Invalid PM visit ID' });
+  }
+
+  try {
+    const result = await db.query(
+      `SELECT p.*, a.model, a.serial_number, b.branch_name, b.branch_code, b.region
+       FROM pm_visits p
+       JOIN atms a ON a.terminal_id = p.terminal_id
+       JOIN branches b ON b.id = a.branch_id
+       WHERE p.id = $1`,
+      [visitId]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'PM visit not found' });
+    const visit = result.rows[0];
+    if (visit.status !== 'BRANCH_CONFIRMED') {
+      return res.status(409).json({ error: 'Reports are available only for branch-confirmed PM visits' });
+    }
+
+    const title = 'Enat Bank Moti PM Tracking';
+    const projectRoot = path.resolve(__dirname, '../../..');
+    const logoCandidates = [
+      path.join(projectRoot, 'uploads', 'enat.png'),
+      path.resolve(__dirname, '../../uploads/enat.png'),
+      path.join(process.cwd(), 'uploads', 'enat.png'),
+      path.join(projectRoot, 'frontend', 'public', 'enat.png'),
+    ];
+    const resolvedLogoPath = logoCandidates.find((candidate) => fs.existsSync(candidate)) || null;
+    if (!resolvedLogoPath) {
+      throw new Error(`Enat Bank logo was not found. Checked: ${logoCandidates.join(', ')}`);
+    }
+    const logoBuffer = fs.readFileSync(resolvedLogoPath);
+    const formatDateOnly = (value) => {
+      if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value.toISOString().slice(0, 10);
+      }
+      if (typeof value === 'string') {
+        const datePart = value.match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+        if (datePart) return datePart;
+      }
+      return value ? String(value) : 'Not scheduled';
+    };
+    const formatPdfValue = (value) => {
+      if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value.toLocaleString('en-GB', {
+          dateStyle: 'medium',
+          timeStyle: 'short',
+          timeZone: 'UTC',
+        });
+      }
+      if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+        const date = new Date(value);
+        if (!Number.isNaN(date.getTime())) {
+          return date.toLocaleString('en-GB', {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+            timeZone: 'UTC',
+          });
+        }
+      }
+      return value === null || value === undefined || value === '' ? 'N/A' : String(value);
+    };
+    const formatTime12Hour = (value) => {
+      const match = typeof value === 'string' ? value.match(/^(\d{2}):(\d{2})/) : null;
+      if (!match) return 'Not recorded';
+      const hour = Number(match[1]);
+      return `${hour % 12 || 12}:${match[2]} ${hour >= 12 ? 'PM' : 'AM'}`;
+    };
+    const scheduledStart = formatDateOnly(visit.scheduled_date);
+    const scheduledEnd = formatDateOnly(visit.scheduled_end_date || visit.scheduled_date);
+    const scheduleText = scheduledEnd !== scheduledStart
+      ? `${scheduledStart} to ${scheduledEnd}`
+      : scheduledStart;
+    const rows = [
+      ['Terminal ID', visit.terminal_id],
+      ['Branch', visit.branch_name],
+      ['Branch Code', visit.branch_code],
+      ['Region', visit.region],
+      ['ATM Model', visit.model || 'Not registered'],
+      ['ATM Serial Number', visit.serial_number || 'Not registered'],
+      ['Schedule', scheduleText],
+      ['Moti Visit Date', formatDateOnly(visit.vendor_visit_date || visit.vendor_completed_at)],
+      ['Vendor', visit.vendor_name || 'Not recorded'],
+      ['Technician', visit.vendor_technician || 'Not recorded'],
+      ['Work Start Time', formatTime12Hour(visit.work_start_time)],
+      ['Work Finished Time', formatTime12Hour(visit.work_finished_time)],
+      ['Vendor Notes', visit.vendor_notes || 'None'],
+      ['Branch Confirmed By', visit.branch_confirmed_by || 'Not recorded'],
+      ['Branch Confirmed At', visit.branch_confirmed_at || 'Not recorded'],
+      ['Branch Remarks', visit.branch_remarks || 'None'],
+    ];
+
+    const doc = new (require('pdfkit'))({ margin: 40, size: 'A4' });
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => {
+      const pdfBuffer = Buffer.concat(chunks);
+      res.set({
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': `attachment; filename="pm-report-${visitId}.pdf"`,
+      });
+      res.send(pdfBuffer);
+    });
+
+    const headerY = 40;
+    doc.image(logoBuffer, 58, headerY, { fit: [62, 62], align: 'center', valign: 'center' });
+    doc.fillColor('#1f2937').fontSize(18).font('Helvetica-Bold').text(title, 145, headerY + 18, { width: 400, align: 'center' });
+
+    doc.fontSize(12).font('Helvetica-Bold').fillColor('#374151').text('Confirmation Page', 50, 110);
+    doc.moveTo(50, 128).lineTo(545, 128).strokeColor('#dfe7f5').stroke();
+
+    let detailsY = 140;
+    for (let index = 0; index < rows.length; index += 2) {
+      const pair = rows.slice(index, index + 2);
+      const cells = pair.map(([label, value], columnIndex) => {
+        const x = columnIndex === 0 ? 50 : 300;
+        const labelWidth = 100;
+        const valueX = x + 105;
+        const valueWidth = 135;
+        const formattedValue = formatPdfValue(value);
+        doc.font('Helvetica-Bold').fontSize(8);
+        const labelHeight = doc.heightOfString(`${label}:`, { width: labelWidth });
+        doc.font('Helvetica').fontSize(8);
+        const valueHeight = doc.heightOfString(formattedValue, { width: valueWidth });
+        return { label, formattedValue, x, valueX, labelWidth, valueWidth, height: Math.max(labelHeight, valueHeight) };
+      });
+      const rowHeight = Math.max(...cells.map((cell) => cell.height)) + 8;
+      if (detailsY + rowHeight > 750) {
+        doc.addPage();
+        detailsY = 55;
+      }
+      cells.forEach(({ label, formattedValue, x, valueX, labelWidth, valueWidth }) => {
+        doc.font('Helvetica-Bold').fontSize(8).fillColor('#374151').text(`${label}:`, x, detailsY, { width: labelWidth });
+        doc.font('Helvetica').fontSize(8).fillColor('#111827').text(formattedValue, valueX, detailsY, { width: valueWidth });
+      });
+      detailsY += rowHeight;
+    }
+
+    doc.addPage();
+    doc.fontSize(12).font('Helvetica-Bold').fillColor('#1f2937').text('Inspection Checklist', 50, 50);
+    doc.moveTo(50, 68).lineTo(545, 68).strokeColor('#dfe7f5').stroke();
+
+    const checklist = visit.vendor_checklist || {};
+    let checklistY = 88;
+    const sectionEntries = Object.entries(checklist).filter(([, fields]) => fields && typeof fields === 'object');
+    sectionEntries.forEach(([sectionKey, fields], sectionIndex) => {
+      const title = sectionKey.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+      const entries = Object.entries(fields || {});
+      const midpoint = Math.ceil(entries.length / 2);
+      const leftEntries = entries.slice(0, midpoint);
+      const rightEntries = entries.slice(midpoint);
+
+      if (checklistY > 700) {
+        doc.addPage();
+        checklistY = 50;
+      }
+      doc.font('Helvetica-Bold').fontSize(10).fillColor('#111827').text(title, 50, checklistY);
+      checklistY += 18;
+
+      const leftColumnX = 50;
+      const rightColumnX = 300;
+      const rowCount = Math.max(leftEntries.length, rightEntries.length);
+      for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+        const rowCells = [leftEntries[rowIndex], rightEntries[rowIndex]].filter(Boolean).map(([fieldKey, fieldValue], columnIndex) => {
+          const label = fieldKey.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+          const value = typeof fieldValue === 'boolean'
+            ? (fieldValue ? 'Verified' : 'Not verified')
+            : fieldValue === null || fieldValue === undefined || fieldValue === ''
+              ? 'Not recorded'
+              : String(fieldValue);
+          const text = `${label}: ${value}`;
+          doc.font('Helvetica').fontSize(8);
+          const height = doc.heightOfString(text, { width: 220 });
+          return { text, x: columnIndex === 0 ? leftColumnX : rightColumnX, height };
+        });
+        const rowHeight = Math.max(...rowCells.map((cell) => cell.height)) + 4;
+        if (checklistY + rowHeight > 750) {
+          doc.addPage();
+          checklistY = 50;
+        }
+        rowCells.forEach(({ text, x }) => {
+          doc.font('Helvetica').fontSize(8).fillColor('#374151').text(text, x, checklistY, { width: 220 });
+        });
+        checklistY += rowHeight;
+      }
+
+      checklistY += 8;
+      if (sectionIndex < sectionEntries.length - 1) {
+        doc.moveTo(50, checklistY - 10).lineTo(545, checklistY - 10).strokeColor('#eef2ff').stroke();
+      }
+    });
+
+    doc.end();
+  } catch (err) {
+    console.error('Failed to generate PM report:', err);
+    res.status(500).json({ error: 'Failed to generate PM report' });
   }
 };
 
@@ -266,8 +550,12 @@ exports.importScheduleWorkbook = async (req, res) => {
   sheet.getRow(1).eachCell((cell, column) => {
     headerIndexes.set(cellText(cell.value).toLowerCase(), column);
   });
-  const requiredHeaders = ['branch name', 'terminal id', 'scheduled date'];
-  const missingHeaders = requiredHeaders.filter((header) => !headerIndexes.has(header));
+  const dateFromIndex = headerIndexes.get('date from') ?? headerIndexes.get('scheduled date');
+  const dateToIndex = headerIndexes.get('date to') ?? headerIndexes.get('scheduled end date');
+  const missingHeaders = ['terminal id'].filter((header) => !headerIndexes.has(header));
+  if (!dateFromIndex) {
+    missingHeaders.push('date from');
+  }
   if (missingHeaders.length) {
     return res.status(400).json({ error: `Missing required column(s): ${missingHeaders.join(', ')}` });
   }
@@ -276,15 +564,20 @@ exports.importScheduleWorkbook = async (req, res) => {
   const errors = [];
   sheet.eachRow((row, rowNumber) => {
     if (rowNumber === 1) return;
-    const branchName = cellText(row.getCell(headerIndexes.get('branch name')).value);
     const terminalId = cellText(row.getCell(headerIndexes.get('terminal id')).value);
-    const scheduledDate = scheduleDate(row.getCell(headerIndexes.get('scheduled date')).value);
-    if (!branchName && !terminalId && !row.getCell(headerIndexes.get('scheduled date')).value) return;
-    if (!branchName || !terminalId || !scheduledDate) {
-      errors.push(`Row ${rowNumber}: branch name, terminal ID, and a valid scheduled date are required`);
+    const scheduledDate = scheduleDate(row.getCell(dateFromIndex).value);
+    const endDateValue = dateToIndex ? row.getCell(dateToIndex).value : null;
+    const scheduledEndDate = endDateValue ? scheduleDate(endDateValue) : scheduledDate;
+    if (!terminalId && !row.getCell(dateFromIndex).value && !row.getCell(dateToIndex || dateFromIndex).value) return;
+    if (!terminalId || !scheduledDate) {
+      errors.push(`Row ${rowNumber}: terminal ID and a valid start date are required`);
       return;
     }
-    rows.push({ rowNumber, branchName, terminalId, scheduledDate });
+    if (scheduledEndDate && scheduledEndDate < scheduledDate) {
+      errors.push(`Row ${rowNumber}: the end date must be on or after the start date`);
+      return;
+    }
+    rows.push({ rowNumber, terminalId, scheduledDate, scheduledEndDate });
   });
   if (rows.length > 500) {
     return res.status(400).json({ error: 'A workbook can contain at most 500 schedule rows per import' });
@@ -295,8 +588,8 @@ exports.importScheduleWorkbook = async (req, res) => {
 
   const rowKeys = new Set();
   for (const row of rows) {
-    const key = `${row.terminalId.toUpperCase()}|${row.scheduledDate}`;
-    if (rowKeys.has(key)) errors.push(`Row ${row.rowNumber}: duplicate terminal and schedule date in this workbook`);
+  const key = `${row.terminalId.toUpperCase()}|${row.scheduledDate}|${row.scheduledEndDate || row.scheduledDate}`;
+  if (rowKeys.has(key)) errors.push(`Row ${row.rowNumber}: duplicate terminal and schedule range in this workbook`);
     rowKeys.add(key);
   }
   if (errors.length) return res.status(400).json({ error: errors.slice(0, 20).join('; ') });
@@ -320,8 +613,6 @@ exports.importScheduleWorkbook = async (req, res) => {
       const terminal = terminalsById.get(row.terminalId.toUpperCase());
       if (!terminal) {
         mappingErrors.push(`Row ${row.rowNumber}: terminal ${row.terminalId} is not a registered active terminal`);
-      } else if (terminal.branch_name.trim().toLowerCase() !== row.branchName.trim().toLowerCase()) {
-        mappingErrors.push(`Row ${row.rowNumber}: terminal ${row.terminalId} belongs to ${terminal.branch_name}, not ${row.branchName}`);
       }
     }
     if (mappingErrors.length) {
@@ -334,21 +625,27 @@ exports.importScheduleWorkbook = async (req, res) => {
     const importedVisitIds = [];
     for (const row of rows) {
       const terminalId = terminalsById.get(row.terminalId.toUpperCase()).terminal_id;
+      const startDate = row.scheduledDate;
+      const endDate = row.scheduledEndDate || row.scheduledDate;
       await client.query(
         'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
-        [terminalId, row.scheduledDate]
+        [terminalId, `${startDate}|${endDate}`]
       );
       const existing = await client.query(
-        'SELECT id FROM pm_visits WHERE terminal_id = $1 AND scheduled_date = $2::date LIMIT 1',
-        [terminalId, row.scheduledDate]
+        `SELECT id FROM pm_visits
+         WHERE terminal_id = $1
+           AND scheduled_date <= $2::date
+           AND COALESCE(scheduled_end_date, scheduled_date) >= $3::date
+         LIMIT 1`,
+        [terminalId, endDate, startDate]
       );
       if (existing.rowCount) {
         skipped += 1;
         continue;
       }
       const inserted = await client.query(
-        'INSERT INTO pm_visits (terminal_id, scheduled_date) VALUES ($1, $2::date) RETURNING id',
-        [terminalId, row.scheduledDate]
+        'INSERT INTO pm_visits (terminal_id, scheduled_date, scheduled_end_date) VALUES ($1, $2::date, $3::date) RETURNING id',
+        [terminalId, startDate, endDate]
       );
       importedVisitIds.push(inserted.rows[0].id);
       imported += 1;

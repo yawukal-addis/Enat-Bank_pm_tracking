@@ -8,7 +8,7 @@ async function getVisit(visitId) {
   const result = await db.query(
     `SELECT p.id, p.terminal_id, p.scheduled_date::text AS scheduled_date, p.status,
             p.vendor_technician, p.vendor_notes, p.branch_confirmed_by,
-            p.cleanliness_rating, p.branch_remarks, b.branch_name
+            p.branch_remarks, b.branch_name
      FROM pm_visits p
      JOIN atms a ON a.terminal_id = p.terminal_id
      JOIN branches b ON b.id = a.branch_id
@@ -117,7 +117,6 @@ async function notifyBranchDecision(visitId) {
       `The branch ${confirmed ? 'confirmed' : 'disputed'} the maintenance visit.`,
       ...visitDetails(visit),
       `Confirmed by: ${visit.branch_confirmed_by || 'Not provided'}`,
-      `Cleanliness rating: ${visit.cleanliness_rating ?? 'Not provided'}`,
       `Branch remarks: ${visit.branch_remarks || 'None'}`,
     ]
   );

@@ -7,6 +7,7 @@ RUN npm config set strict-ssl false
 RUN npm ci --omit=dev
 
 COPY backend/ ./
+COPY uploads/enat.png ./uploads/enat.png
 COPY email-service/ /email-service/
 
 EXPOSE 5000

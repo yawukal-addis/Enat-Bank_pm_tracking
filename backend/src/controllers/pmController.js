@@ -5,6 +5,62 @@ const {
   notifyBranchDecision,
 } = require('../services/pmEmailNotifications');
 
+const CHECKLIST_FIELDS = {
+  upper_chamber: 'card_reader_clean pulley_condition motor_status receipt_printer_clean receipt_printer_health receipt_paper journal_printer_clean journal_printer_health journal_paper pe_core_clean maintenance_keyboard_clean pe_core_brightness lcd_crt_clean lcd_crt_condition epp_clean epp_health epp_sound fdk_clean fdk_health cabinetry_clean fascia_molding_clean'.split(' '),
+  lower_chamber: 'presenter_module_clean presenter_lvdt_clean presenter_sector_clean transport_belt_clean timing_disk_clean paddle_wheel_clean air_filter_clean harness_clean bin_catch_condition presenter_sound shutter_assembly_clean bearing_clean pick_module_clean pick_module_belt_clean pick_module_timing_disk_set pick_module_d_wheel_set sensor_clean suction_cap_condition pick_arm_condition side_controller_board_condition solenoid_valve_clean mouse_plate_clean safe_assembly_clean cosmetic_door_clean cassette_pusher_status track_door_movement'.split(' '),
+  media_quality: ['quality'],
+  site_status: 'booth_cooling cooling_period ground_wire link_status camera_status ej_status'.split(' '),
+};
+const CHECKLIST_TASK_FIELDS = new Set([
+  ...Object.values(CHECKLIST_FIELDS).flat().filter((field) => field.endsWith('_clean')),
+  'pick_module_timing_disk_set',
+  'pick_module_d_wheel_set',
+  'track_door_movement',
+]);
+
+function hasCompleteVendorChecklist(checklist) {
+  if (!checklist || typeof checklist !== 'object' || Array.isArray(checklist) ||
+      Object.keys(checklist).length !== Object.keys(CHECKLIST_FIELDS).length) return false;
+
+  return Object.entries(CHECKLIST_FIELDS).every(([section, fields]) => {
+    const values = checklist[section];
+    if (!values || typeof values !== 'object' || Array.isArray(values) ||
+        Object.keys(values).length !== fields.length) return false;
+    return fields.every((field) => {
+      const value = values[field];
+      return CHECKLIST_TASK_FIELDS.has(field)
+        ? value === true
+        : typeof value === 'string' && value.trim().length > 0;
+    });
+  });
+}
+
+function normalizeScheduleWindow(body) {
+  const startRaw = body?.scheduled_date ?? body?.date_from ?? body?.from_date;
+  const endRaw = body?.scheduled_end_date ?? body?.date_to ?? body?.to_date ?? startRaw;
+
+  if (typeof startRaw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(startRaw)) {
+    return null;
+  }
+  if (typeof endRaw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(endRaw)) {
+    return null;
+  }
+
+  const startDate = new Date(`${startRaw}T00:00:00Z`);
+  const endDate = new Date(`${endRaw}T00:00:00Z`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+    return null;
+  }
+  if (endDate < startDate) {
+    return { invalid: true };
+  }
+
+  return {
+    scheduled_date: startRaw,
+    scheduled_end_date: endRaw,
+  };
+}
+
 async function getEmailWarning(event, notification) {
   try {
     await notification();
@@ -20,7 +76,7 @@ exports.getAllVisits = async (req, res) => {
   try {
     const { branch_id, status } = req.query;
     let queryText = `
-      SELECT p.*, a.branch_id, b.branch_name, b.branch_code
+      SELECT p.*, a.branch_id, a.model, a.serial_number, b.branch_name, b.branch_code
       FROM pm_visits p
       JOIN atms a ON p.terminal_id = a.terminal_id
       JOIN branches b ON a.branch_id = b.id
@@ -57,28 +113,39 @@ exports.getAllVisits = async (req, res) => {
 
 // Create a new PM schedule (Admin)
 exports.createSchedule = async (req, res) => {
-  const { terminal_id, scheduled_date, vendor_name } = req.body;
-  if (typeof terminal_id !== 'string' || !terminal_id.trim() ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(scheduled_date || '') ||
-      Number.isNaN(Date.parse(`${scheduled_date}T00:00:00Z`)) ||
-      new Date(`${scheduled_date}T00:00:00Z`).toISOString().slice(0, 10) !== scheduled_date) {
-    return res.status(400).json({ error: 'A terminal ID and valid scheduled date are required' });
+  const { terminal_id, vendor_name } = req.body;
+  const scheduleWindow = normalizeScheduleWindow(req.body);
+
+  if (typeof terminal_id !== 'string' || !terminal_id.trim()) {
+    return res.status(400).json({ error: 'A terminal ID is required' });
   }
+  if (!scheduleWindow) {
+    return res.status(400).json({ error: 'A valid schedule start date is required' });
+  }
+  if (scheduleWindow.invalid) {
+    return res.status(400).json({ error: 'The schedule end date must be on or after the start date' });
+  }
+
   try {
     const atm = await db.query(
       'SELECT id FROM atms WHERE terminal_id = $1 AND is_active = TRUE',
       [terminal_id.trim()]
     );
     if (!atm.rowCount) return res.status(400).json({ error: 'Selected terminal is not registered and active' });
+
     const duplicate = await db.query(
-      'SELECT id FROM pm_visits WHERE terminal_id = $1 AND scheduled_date = $2::date',
-      [terminal_id.trim(), scheduled_date]
+      `SELECT id FROM pm_visits
+       WHERE terminal_id = $1
+         AND scheduled_date <= $2::date
+         AND COALESCE(scheduled_end_date, scheduled_date) >= $3::date`,
+      [terminal_id.trim(), scheduleWindow.scheduled_end_date, scheduleWindow.scheduled_date]
     );
-    if (duplicate.rowCount) return res.status(409).json({ error: 'A schedule already exists for this terminal and date' });
+    if (duplicate.rowCount) return res.status(409).json({ error: 'This terminal already has a schedule overlapping the selected date range' });
+
     const result = await db.query(
-      `INSERT INTO pm_visits (terminal_id, scheduled_date, vendor_name)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [terminal_id.trim(), scheduled_date, vendor_name || 'Moti Engineering']
+      `INSERT INTO pm_visits (terminal_id, scheduled_date, scheduled_end_date, vendor_name)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [terminal_id.trim(), scheduleWindow.scheduled_date, scheduleWindow.scheduled_end_date, vendor_name || 'Moti Engineering']
     );
     const emailWarning = await getEmailWarning(
       'creating a PM schedule',
@@ -96,16 +163,27 @@ exports.createSchedule = async (req, res) => {
 
 exports.updateSchedule = async (req, res) => {
   const visitId = Number(req.params.id);
-  const { terminal_id, scheduled_date } = req.body;
+  const { terminal_id } = req.body;
+  const scheduleWindow = normalizeScheduleWindow(req.body);
+
   if (!Number.isInteger(visitId) || visitId < 1 ||
-      typeof terminal_id !== 'string' || !terminal_id.trim() ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(scheduled_date || '') ||
-      Number.isNaN(Date.parse(`${scheduled_date}T00:00:00Z`)) ||
-      new Date(`${scheduled_date}T00:00:00Z`).toISOString().slice(0, 10) !== scheduled_date) {
-    return res.status(400).json({ error: 'A valid schedule ID, terminal ID, and scheduled date are required' });
+      typeof terminal_id !== 'string' || !terminal_id.trim()) {
+    return res.status(400).json({ error: 'A valid schedule ID, terminal ID, and schedule date are required' });
+  }
+  if (!scheduleWindow) {
+    return res.status(400).json({ error: 'A valid schedule start date is required' });
+  }
+  if (scheduleWindow.invalid) {
+    return res.status(400).json({ error: 'The schedule end date must be on or after the start date' });
   }
 
   try {
+    const existing = await db.query('SELECT status FROM pm_visits WHERE id = $1', [visitId]);
+    if (!existing.rowCount) return res.status(404).json({ error: 'Schedule not found' });
+    if (existing.rows[0].status !== 'SCHEDULED') {
+      return res.status(409).json({ error: 'Only scheduled visits can be edited. Confirmed and disputed visits are locked.' });
+    }
+
     const atm = await db.query(
       'SELECT id FROM atms WHERE terminal_id = $1 AND is_active = TRUE',
       [terminal_id.trim()]
@@ -114,28 +192,25 @@ exports.updateSchedule = async (req, res) => {
 
     const duplicate = await db.query(
       `SELECT id FROM pm_visits
-       WHERE terminal_id = $1 AND scheduled_date = $2::date AND id <> $3`,
-      [terminal_id.trim(), scheduled_date, visitId]
+       WHERE terminal_id = $1
+         AND id <> $2
+         AND scheduled_date <= $3::date
+         AND COALESCE(scheduled_end_date, scheduled_date) >= $4::date`,
+      [terminal_id.trim(), visitId, scheduleWindow.scheduled_end_date, scheduleWindow.scheduled_date]
     );
-    if (duplicate.rowCount) return res.status(409).json({ error: 'A schedule already exists for this terminal and date' });
+    if (duplicate.rowCount) return res.status(409).json({ error: 'This terminal already has a schedule overlapping the selected date range' });
 
     const updated = await db.query(
       `UPDATE pm_visits
-       SET terminal_id = $1, scheduled_date = $2::date
-       WHERE id = $3 AND status = 'SCHEDULED'
+       SET terminal_id = $1, scheduled_date = $2::date, scheduled_end_date = $3::date
+       WHERE id = $4 AND status = 'SCHEDULED'
        RETURNING *`,
-      [terminal_id.trim(), scheduled_date, visitId]
+      [terminal_id.trim(), scheduleWindow.scheduled_date, scheduleWindow.scheduled_end_date, visitId]
     );
     if (!updated.rowCount) {
-      const existing = await db.query('SELECT status FROM pm_visits WHERE id = $1', [visitId]);
-      return res.status(existing.rowCount ? 409 : 404).json({
-        error: existing.rowCount ? 'Only scheduled visits can be edited' : 'Schedule not found'
-      });
+      return res.status(409).json({ error: 'Only scheduled visits can be edited. Confirmed and disputed visits are locked.' });
     }
-    const emailWarning = await getEmailWarning(
-      'updating a PM schedule',
-      () => notifySchedule(updated.rows[0].id, 'updated')
-    );
+    const emailWarning = await getEmailWarning('updating a PM schedule', () => notifySchedule(updated.rows[0].id, 'updated'));
     res.json({
       ...updated.rows[0],
       ...(emailWarning ? { email_warning: emailWarning } : {}),
@@ -153,6 +228,12 @@ exports.deleteSchedule = async (req, res) => {
   }
 
   try {
+    const existing = await db.query('SELECT status FROM pm_visits WHERE id = $1', [visitId]);
+    if (!existing.rowCount) return res.status(404).json({ error: 'Schedule not found' });
+    if (existing.rows[0].status !== 'SCHEDULED') {
+      return res.status(409).json({ error: 'Only scheduled visits can be deleted. Confirmed and disputed visits are locked.' });
+    }
+
     const deleted = await db.query(
       `DELETE FROM pm_visits
        WHERE id = $1 AND status = 'SCHEDULED'
@@ -160,10 +241,7 @@ exports.deleteSchedule = async (req, res) => {
       [visitId]
     );
     if (!deleted.rowCount) {
-      const existing = await db.query('SELECT status FROM pm_visits WHERE id = $1', [visitId]);
-      return res.status(existing.rowCount ? 409 : 404).json({
-        error: existing.rowCount ? 'Only scheduled visits can be deleted' : 'Schedule not found'
-      });
+      return res.status(409).json({ error: 'Only scheduled visits can be deleted. Confirmed and disputed visits are locked.' });
     }
     res.json({ message: 'Schedule deleted successfully' });
   } catch (err) {
@@ -175,17 +253,50 @@ exports.deleteSchedule = async (req, res) => {
 // Vendor marks visit as completed
 exports.vendorComplete = async (req, res) => {
   const { id } = req.params;
-  const { vendor_technician, vendor_notes } = req.body;
-  if (!vendor_technician?.trim() || !vendor_notes?.trim()) return res.status(400).json({ error: 'Technician name and maintenance notes are required' });
+  const {
+    vendor_technician,
+    vendor_notes,
+    vendor_visit_date,
+    work_start_time,
+    work_finished_time,
+    vendor_checklist,
+  } = req.body;
+  const validTime = (value) => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+  const validVisitDate = (value) => {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const date = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  };
+  if (!vendor_technician?.trim() || !vendor_notes?.trim()) {
+    return res.status(400).json({ error: 'Technician name and maintenance notes are required' });
+  }
+  if (!validVisitDate(vendor_visit_date)) {
+    return res.status(400).json({ error: 'A valid Moti visit date is required' });
+  }
+  if (!validTime(work_start_time) || !validTime(work_finished_time)) {
+    return res.status(400).json({ error: 'Work start and finish times are required and must be valid' });
+  }
+  if (!hasCompleteVendorChecklist(vendor_checklist) ||
+      !['GOOD', 'NOT_GOOD'].includes(vendor_checklist.site_status?.camera_status) ||
+      !['GOOD', 'NOT_GOOD'].includes(vendor_checklist.site_status?.ej_status)) {
+    return res.status(400).json({ error: 'Complete and verify every ATM checklist item, including camera and EJ status' });
+  }
+  if (!['GOOD', 'BAD'].includes(vendor_checklist.media_quality?.quality)) {
+    return res.status(400).json({ error: 'Select Good or Bad for media quality' });
+  }
   try {
     const result = await db.query(
       `UPDATE pm_visits
        SET status = 'VENDOR_COMPLETED',
            vendor_technician = $1,
            vendor_notes = $2,
+           vendor_visit_date = $3::date,
+           work_start_time = $4,
+           work_finished_time = $5,
+           vendor_checklist = $6::jsonb,
            vendor_completed_at = CURRENT_TIMESTAMP
-       WHERE id = $3 AND status = 'SCHEDULED' RETURNING *`,
-      [vendor_technician, vendor_notes, id]
+       WHERE id = $7 AND status = 'SCHEDULED' RETURNING *`,
+      [vendor_technician.trim(), vendor_notes.trim(), vendor_visit_date, work_start_time, work_finished_time, JSON.stringify(vendor_checklist), id]
     );
     if (result.rows.length === 0) {
       const exists = await db.query('SELECT id FROM pm_visits WHERE id = $1', [id]);
@@ -208,30 +319,27 @@ exports.vendorComplete = async (req, res) => {
 // Branch confirms or disputes visit
 exports.branchConfirm = async (req, res) => {
   const { id } = req.params;
-  const { status, cleanliness_rating, branch_remarks } = req.body;
+  const { status, branch_remarks } = req.body;
 
   if (!['BRANCH_CONFIRMED', 'BRANCH_DISPUTED'].includes(status)) {
     return res.status(400).json({ error: 'Invalid confirmation status' });
-  }
-  if (status === 'BRANCH_CONFIRMED' && (!Number.isInteger(Number(cleanliness_rating)) || Number(cleanliness_rating) < 1 || Number(cleanliness_rating) > 5)) {
-    return res.status(400).json({ error: 'A cleanliness rating from 1 to 5 is required to confirm' });
   }
 
   try {
     const result = await db.query(
       `UPDATE pm_visits
        SET status = $1,
-           cleanliness_rating = $2,
-           branch_remarks = $3,
-           branch_confirmed_by = $4,
+           cleanliness_rating = NULL,
+           branch_remarks = $2,
+           branch_confirmed_by = $3,
            branch_confirmed_at = CURRENT_TIMESTAMP
-       WHERE id = $5 AND status = 'VENDOR_COMPLETED'
+       WHERE id = $4 AND status = 'VENDOR_COMPLETED'
          AND EXISTS (
            SELECT 1 FROM user_atms ua
-           WHERE ua.terminal_id = pm_visits.terminal_id AND ua.user_id = $6
+           WHERE ua.terminal_id = pm_visits.terminal_id AND ua.user_id = $5
          )
        RETURNING *`,
-      [status, cleanliness_rating, branch_remarks, req.user.full_name, id, req.user.id]
+      [status, branch_remarks, req.user.full_name, id, req.user.id]
     );
     if (result.rows.length === 0) {
       const exists = await db.query(
@@ -266,8 +374,7 @@ exports.getAnalytics = async (req, res) => {
         COUNT(CASE WHEN status = 'BRANCH_CONFIRMED' THEN 1 END) as confirmed,
         COUNT(CASE WHEN status = 'VENDOR_COMPLETED' THEN 1 END) as pending_branch,
         COUNT(CASE WHEN status = 'BRANCH_DISPUTED' THEN 1 END) as disputed,
-        COUNT(CASE WHEN status = 'SCHEDULED' THEN 1 END) as pending_vendor,
-        ROUND(AVG(cleanliness_rating), 2) as avg_rating
+        COUNT(CASE WHEN status = 'SCHEDULED' THEN 1 END) as pending_vendor
       FROM pm_visits p
       JOIN atms a ON p.terminal_id = a.terminal_id
       WHERE ($1::varchar[] IS NULL OR p.terminal_id = ANY($1::varchar[]))
